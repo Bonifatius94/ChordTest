@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace Chord.Lib.Core
@@ -29,6 +30,33 @@ namespace Chord.Lib.Core
         public string IpAddress { get; set; }
         public string Port { get; set; }
         public ChordHealthStatus State { get; set; } = ChordHealthStatus.Questionable;
+
+        #region Equality Check
+
+        public override bool Equals(object other)
+        {
+            return other?.GetType() == typeof(IChordEndpoint)
+                && Equals((IChordEndpoint)other);
+        }
+
+        // return always 0 to enforce calling the Equals() function
+        public override int GetHashCode() => 0;
+
+        public bool Equals(IChordEndpoint other)
+        {
+            return other != null
+                && other.NodeId.Equals(this.NodeId)
+                && other.IpAddress.Equals(this.IpAddress)
+                && other.Port.Equals(this.Port);
+        }
+
+        #endregion Equality Check
+
+        #region ToString
+
+        public override string ToString() => $"{ NodeId }@{ IpAddress }:{ Port }";
+
+        #endregion ToSTring
     }
 
     public class ChordRequestMessage : IChordRequestMessage
@@ -55,7 +83,7 @@ namespace Chord.Lib.Core
         public IEnumerable<IChordEndpoint> FingerTable { get; set; }
     }
 
-    public interface IChordEndpoint
+    public interface IChordEndpoint : IEquatable<IChordEndpoint>
     {
         // summary of remote node features
         long NodeId { get; set; }

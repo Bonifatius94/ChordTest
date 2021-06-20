@@ -113,6 +113,7 @@ namespace Chord.Lib.Core
                 Port = chordPort,
                 State = ChordHealthStatus.Starting
             };
+            this.successor = this.local;
         }
 
         public long NodeId => local.NodeId;
@@ -134,6 +135,8 @@ namespace Chord.Lib.Core
             = new Dictionary<long, IChordEndpoint>();
 
         private CancellationTokenSource backgroundTaskCallback;
+        bool isJoinActive = false;
+        //private Mutex updateFingerTableMutex = new Mutex();
 
         #region Chord Client
 
@@ -145,18 +148,34 @@ namespace Chord.Lib.Core
             if (bootstrap == null) { throw new InvalidOperationException(
                 "Cannot find a bootstrap node! Please try to join again!"); }
 
-            // phase 1: determine the successor by a key lookup
-
+            // check for join abortion conditions
+            if (bootstrap.Equals(local) || local.State == ChordHealthStatus.Idle) { return; }
             if (local.State != ChordHealthStatus.Starting) { throw new InvalidOperationException(
                 "Cannot join cluster! Make sure the node is in 'Starting' state!"); }
 
+            // phase 1: determine the successor by a key lookup
+
             do {
 
+                // look up the successor's node id
+                var lookupResponse = await sendRequest(
+                    new ChordRequestMessage()
+                    {
+                        Type = ChordRequestType.KeyLookup,
+                        RequesterId = local.NodeId,
+                        RequestedResourceId = local.NodeId
+                    },
+                    bootstrap
+                );
+                successor = lookupResponse.Responder;
+
+                // make sure that the node's id is unique
+                // if not draw a new id and repeat the lookup
+                if (successor.NodeId != local.NodeId) { break; }
                 local.NodeId = getRandId();
-                successor = await LookupKey(local.NodeId, bootstrap);
 
             // continue until the generated node id is unique
-            } while (successor.NodeId == local.NodeId);
+            } while (true);
 
             // phase 2: initiate the join process
 
@@ -190,7 +209,7 @@ namespace Chord.Lib.Core
                 new ChordRequestMessage() {
                     Type = ChordRequestType.CommitNodeJoin,
                     RequesterId = local.NodeId,
-                    NewSuccessor = local
+                    NewPredecessor = local
                 },
                 successor
             );
@@ -209,8 +228,9 @@ namespace Chord.Lib.Core
 
             // start the health monitoring / finger table update
             // procedures as scheduled background tasks
-            backgroundTaskCallback = new CancellationTokenSource();
-            createBackgroundTasks(backgroundTaskCallback.Token);
+            //backgroundTaskCallback = new CancellationTokenSource();
+            //createBackgroundTasks(backgroundTaskCallback.Token);
+            // TODO: enable background tasks again
         }
 
         private void createBackgroundTasks(CancellationToken token)
@@ -293,6 +313,9 @@ namespace Chord.Lib.Core
         public async Task<IChordEndpoint> LookupKey(
             long key, IChordEndpoint explicitReceiver=null)
         {
+            // handle bootstrap case for network initialization
+            if (fingerTable.Count == 0) { return local; }
+
             // determine the receiver to be forwarded the lookup request to
             var receiver = explicitReceiver ?? fingerTable[getBestFingerId(key)];
 
@@ -440,12 +463,9 @@ namespace Chord.Lib.Core
             IChordRequestMessage request)
         {
             // handle the special case for being the initial node of the cluster
-            // seving the first lookup request of a node join
-            if (local.State == ChordHealthStatus.Starting)
-            {
-                // TODO: think of what else needs to be done here ...
-                return new ChordResponseMessage() { Responder = local };
-            }
+            // serving the first lookup request of a node join
+            if (request.RequestedResourceId.Equals(local.NodeId)) {
+                return new ChordResponseMessage() { Responder = local }; }
 
             // perform key lookup and return the endpoint responsible for the key
             var responder = await LookupKey(request.RequestedResourceId);
@@ -466,7 +486,16 @@ namespace Chord.Lib.Core
             // inform the payload component that it has to send the payload
             // data chunk to the joining node that it is now responsible for
 
-            // currently nothing to do here ...
+            // wait until the concurrent join/leave operation is complete
+            if (isJoinActive)
+            {
+                while (true)
+                {
+                    Task.Delay(50).Wait();
+                    if (!isJoinActive) {  } // TODO: finish implementation
+                }
+            }
+
             // TODO: trigger copy process for payload data transmission
 
             return new ChordResponseMessage() {
@@ -482,18 +511,45 @@ namespace Chord.Lib.Core
             // -> predecessor.successor = joining node
             // -> this.predecessor = joining node
 
-            var response = await sendRequest(
+            Console.WriteLine($"joining { request.NewPredecessor } to { local }");
+
+            var oldPredecessor = predecessor ?? local;
+            var joiningNode = request.NewPredecessor;
+
+            // send an 'update successor' request to the former predecessor
+            var updatePredResponse = await sendRequest(
                 new ChordRequestMessage() {
                     Type = ChordRequestType.UpdateSuccessor,
                     RequesterId = local.NodeId,
-                    NewSuccessor = request.NewSuccessor
+                    NewSuccessor = joiningNode
                 },
-                predecessor);
+                oldPredecessor
+            );
 
-            return new ChordResponseMessage() {
+            // TODO: figure out what to do when the 'update successor' operation failed
+
+            // create the response to be returned
+            var response = new ChordResponseMessage()
+            {
                 Responder = local,
-                CommitSuccessful = response.CommitSuccessful
+                CommitSuccessful = updatePredResponse.CommitSuccessful,
+                Predecessor = oldPredecessor,
+                FingerTable = fingerTable.Values
             };
+
+            // update the predecessor of this node
+            predecessor = joiningNode;
+            fingerTable.Add(predecessor.NodeId, predecessor);
+
+            // update the state to 'idle' if this node was the initial node on the cluster
+            if (fingerTable.Count == 1) { local.State = ChordHealthStatus.Idle; }
+
+            // allow the next join/leave operation to start
+            //nodeJoinLeaveMutex.ReleaseMutex();
+            // info: mutex does not work because the join
+
+
+            return response;
         }
 
         private async Task<IChordResponseMessage> processInitNodeLeave(
@@ -502,7 +558,8 @@ namespace Chord.Lib.Core
             // prepare for the predecessor leaving the network
             // inform the payload component that it will be sent payload data
 
-            // currently nothing to do here ...
+            // wait until the concurrent join/leave operation is complete
+            //nodeJoinLeaveMutex.WaitOne();
 
             return new ChordResponseMessage() {
                 Responder = local,
@@ -524,16 +581,24 @@ namespace Chord.Lib.Core
                 },
                 predecessor);
 
-            return new ChordResponseMessage() {
+            // create the response to be returned
+            response = new ChordResponseMessage() {
                 Responder = local,
                 CommitSuccessful = response.CommitSuccessful
             };
+
+            // allow the next join/leave operation to start
+            //nodeJoinLeaveMutex.ReleaseMutex();
+
+            return response;
         }
 
         private async Task<IChordResponseMessage> processUpdateSuccessor(
             IChordRequestMessage request)
         {
             const int timeout = 10;
+
+            Console.WriteLine($"updating successor of { local } from { successor } to { request.NewSuccessor }");
 
             // ping the new successor to make sure it is healthy
             var status = await CheckHealth(request.NewSuccessor, timeout, ChordHealthStatus.Dead);
@@ -560,12 +625,13 @@ namespace Chord.Lib.Core
             // TODO: think of only forwarding to healthy nodes
 
             // make sure the finger table is not empty
-            if (cachedFingerIds.Count == 0) { throw new InvalidOperationException(
-                "The finger table is empty! Make sure the node was properly initialized!"); }
+            if (cachedFingerIds.Count == 0 && local.State == ChordHealthStatus.Idle) {
+                throw new InvalidOperationException(
+                    "The finger table is empty! Make sure the node was properly initialized!"); }
 
             // termination case: forward to the successor if it is the manager of the key
             // recursion case: forward to the closest predecessing finger of the key
-            return successor.NodeId >= key ? successor.NodeId
+            return (long)restMod(successor.NodeId + key, maxId) >= key ? successor.NodeId
                 : getClosestPredecessor(key, cachedFingerIds);
         }
 
@@ -590,7 +656,7 @@ namespace Chord.Lib.Core
         private long getRandId()
         {
             // concatenate two random 32-bit integers to a long value
-            return ((long)rng.Next(int.MinValue, int.MaxValue) << 32)
+            return ((long)rng.Next(int.MaxValue) << 32)
                  | (long)(uint)rng.Next(int.MinValue, int.MaxValue);
         }
 
